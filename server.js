@@ -32,7 +32,7 @@ async function ensureSchema() {
       id SERIAL PRIMARY KEY,
       title_norm TEXT NOT NULL,
       artist_norm TEXT,
-      work_code TEXT CHECK (work_code ~ '^[0-9]{3}-[0-9]{4}-[0-9]$') OR work_code IS NULL,
+      work_code TEXT CHECK ((work_code ~ '^[0-9]{3}-[0-9]{4}-[0-9]$') OR work_code IS NULL),
       bpm TEXT,
       key TEXT,
       confidence INTEGER DEFAULT 0,
