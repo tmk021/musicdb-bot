@@ -1,5 +1,20 @@
 import express from "express";
 import nacl from "tweetnacl";
+import pkg from "pg";
+const { Pool } = pkg;
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// シンプル正規化（必要なら後でNFKC/かな整形を追加）
+const norm = s => (s || "").trim();
+
+// 作品コード整形：8桁→ 3-4-1
+const normalizeWorkCode = raw => {
+  const d = (raw || "").replace(/\D/g, "");
+  if (d.length !== 8) return null;
+  const f = `${d.slice(0,3)}-${d.slice(3,7)}-${d.slice(7)}`;
+  return /^\d{3}-\d{4}-\d$/.test(f) ? f : null;
+};
+
 
 // --- Middleware to capture raw body for Discord signature verification
 const app = express();
@@ -50,17 +65,72 @@ app.post("/discord/commands", (req, res) => {
 
   // Minimal handlers (you can expand later)
   if (name === "track_search") {
-    const title = data.data.options?.find(o => o.name === "title")?.value || "";
-    const artist = data.data.options?.find(o => o.name === "artist")?.value || "";
+  try {
+    const title  = norm(data.data.options?.find(o => o.name === "title")?.value);
+    const artist = norm(data.data.options?.find(o => o.name === "artist")?.value);
 
-    // Immediate ACK: respond with a simple message (type 4 = CHANNEL_MESSAGE_WITH_SOURCE)
+    // 1) まずDBから検索
+    const q1 = `SELECT * FROM tracks
+                WHERE title_norm = $1 AND (artist_norm = $2 OR $2 = '')
+                ORDER BY updated_at DESC LIMIT 1`;
+    const r1 = await pool.query(q1, [title, artist]);
+
+    if (r1.rows.length) {
+      const t = r1.rows[0];
+      return res.json({
+        type: 4,
+        data: {
+          content:
+`🎵 ${t.title_norm}${t.artist_norm ? " — " + t.artist_norm : ""}
+作品コード: ${t.work_code || "—"}
+BPM/Key: ${t.bpm || "—"} / ${t.key || "—"}
+信頼度: ${t.confidence || 0}`
+        }
+      });
+    }
+
+    // 2) なければ種レコードを作成（後で外部連携で埋める）
+    const ins = await pool.query(
+      `INSERT INTO tracks (title_norm, artist_norm, confidence, provenance)
+       VALUES ($1, $2, 0, '{"status":"seed"}') RETURNING *`,
+      [title, artist]
+    );
+
+    // 3) ここで「外部最小連携」を呼ぶ場所（まずはスタブ）
+    const stub = {
+      work_code: normalizeWorkCode("123-4567-8"),
+      bpm: "92",
+      key: "A minor",
+      confidence: 96,
+      provenance: { source: "stub", fetched_at: new Date().toISOString() }
+    };
+
+    if (stub && stub.confidence >= 95) {
+      await pool.query(
+        `UPDATE tracks SET
+           work_code=$1, bpm=$2, key=$3, confidence=$4,
+           provenance = COALESCE(provenance,'{}'::jsonb) || $5::jsonb,
+           updated_at=now()
+         WHERE id=$6`,
+        [stub.work_code, stub.bpm, stub.key, stub.confidence, JSON.stringify(stub.provenance), ins.rows[0].id]
+      );
+    }
+
     return res.json({
       type: 4,
       data: {
-        content: `🎵 検索受付: 「${title}」${artist ? " / " + artist : ""}\n（サンプル動作：後でDBやDrive連携を追加できます）`
+        content:
+`🟡 データ未登録でした。ベースを作成しました。
+タイトル: ${title}${artist ? " / " + artist : ""}
+→ 後続の自動再検索でBPM/Key/作品コードを取得します。`
       }
     });
+  } catch (e) {
+    console.error("track_search error:", e);
+    return res.json({ type: 4, data: { content: "❌ 内部エラーが発生しました（管理者に通知済み）" } });
   }
+}
+
 
   if (name === "artist_list") {
     const artist = data.data.options?.find(o => o.name === "name")?.value || "";
