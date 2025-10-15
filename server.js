@@ -129,7 +129,11 @@ app.post("/discord/commands", async (req, res) => {
       let found = null;
       if (pool) {
         const r = await pool.query(
-          "SELECT * FROM tracks WHERE title_norm=$1 AND (artist_norm=$2 OR $2='') ORDER BY updated_at DESC LIMIT 1",
+          `SELECT * FROM tracks
+           WHERE title_norm = $1
+           AND (artist_norm = $2 OR $2 = '')
+           ORDER BY updated_at DESC
+           LIMIT 1`,
           [title, artist]
         );
         found = r.rows[0] || null;
