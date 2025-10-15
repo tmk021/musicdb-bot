@@ -150,8 +150,10 @@ app.post("/discord/commands", async (req, res) => {
       let insertedId = null;
       if (pool) {
         const ins = await pool.query(
-          "INSERT INTO tracks(title_norm, artist_norm, confidence, provenance) VALUES ($1,$2,0,'{"status":"seed"}') RETURNING id",
-          [title, artist]
+          //"INSERT INTO tracks(title_norm, artist_norm, confidence, provenance) VALUES ($1,$2,0,'{"status":"seed"}') RETURNING id",
+          `INSERT INTO tracks (title_norm, artist_norm, confidence, provenance) VALUES ($1, $2, $3, $4::jsonb) RETURNING id`,
+          [title, artist, 0, JSON.stringify({ status: "seed" })]
+          //[title, artist]
         );
         insertedId = ins.rows[0]?.id;
       }
