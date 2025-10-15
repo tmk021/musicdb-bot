@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import fetch from "node-fetch";
 import { google } from "googleapis";
@@ -5,29 +6,16 @@ import pkg from "pg";
 import nacl from "tweetnacl";
 const { Pool } = pkg;
 
-const app = express();
-app.use(express.text({ type: "*/*" }));
+const app = express(); // ← グローバルな body-parser は付けない（Discord署名のため）
 
+/* ====== ENV ====== */
 const PORT = process.env.PORT || 3000;
 const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const SYSTEM_STATUS_CHANNEL = process.env.SYSTEM_STATUS_CHANNEL;
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
 
-function verifyDiscordSignature(req) {
-  if (!DISCORD_PUBLIC_KEY) return false;
-  const signature = req.get("X-Signature-Ed25519");
-  const timestamp = req.get("X-Signature-Timestamp");
-  const body = req.body || "";
-  if (!signature || !timestamp) return false;
-  const isVerified = nacl.sign.detached.verify(
-    Buffer.from(timestamp + body),
-    Buffer.from(signature, "hex"),
-    Buffer.from(DISCORD_PUBLIC_KEY, "hex")
-  );
-  return isVerified;
-}
-
+/* ====== UTILS ====== */
 async function discordNotify(message) {
   if (!DISCORD_TOKEN || !SYSTEM_STATUS_CHANNEL) return;
   await fetch(`https://discord.com/api/v10/channels/${SYSTEM_STATUS_CHANNEL}/messages`, {
@@ -57,6 +45,7 @@ async function ensureSchema() {
 
 const norm = (s) => (s || "").trim();
 
+/* ====== DB → CSV ====== */
 async function dumpCsvFromDb() {
   if (!pool) return "title,artist,work_code,bpm,key,confidence\n";
   const { rows } = await pool.query(
@@ -79,6 +68,7 @@ async function dumpCsvFromDb() {
   return header + (body ? body + "\n" : "");
 }
 
+/* ====== Google Drive upload ====== */
 async function uploadToDrive(filename, csvText) {
   const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN } = process.env;
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
@@ -109,15 +99,31 @@ async function uploadToDrive(filename, csvText) {
   return fileRes.data.webViewLink;
 }
 
+/* ====== 外部検索（雛形） ====== */
 import { lookupExternalMinimal } from "./services/lookup.js";
 
+/* ====== Routes ====== */
 app.get("/", (_req, res) => res.send("MusicDB Bot Server is running"));
 
-app.post("/discord/commands", async (req, res) => {
+/** Discord Slash Commands — raw JSON で署名検証 */
+app.post("/discord/commands", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-    if (!verifyDiscordSignature(req)) return res.status(401).send("bad signature");
-    const data = JSON.parse(req.body || "{}");
+    // ---- Verify signature (raw Body 必須) ----
+    const signature = req.get("X-Signature-Ed25519");
+    const timestamp = req.get("X-Signature-Timestamp");
+    const raw = req.body; // Buffer
+    if (!DISCORD_PUBLIC_KEY || !signature || !timestamp || !raw) return res.status(401).send("missing sig");
+
+    const ok = nacl.sign.detached.verify(
+      Buffer.concat([Buffer.from(timestamp, "utf8"), Buffer.from(raw)]),
+      Buffer.from(signature, "hex"),
+      Buffer.from(DISCORD_PUBLIC_KEY, "hex")
+    );
+    if (!ok) return res.status(401).send("bad sig");
+
+    const data = JSON.parse(raw.toString("utf8"));
     if (data?.type === 1) return res.json({ type: 1 }); // PING
+
     const name = data?.data?.name;
 
     if (name === "track_search") {
@@ -126,12 +132,13 @@ app.post("/discord/commands", async (req, res) => {
 
       await ensureSchema();
 
+      // 1) 既存ヒット
       let found = null;
       if (pool) {
         const r = await pool.query(
           `SELECT * FROM tracks
            WHERE title_norm = $1
-           AND (artist_norm = $2 OR $2 = '')
+             AND (artist_norm = $2 OR $2 = '')
            ORDER BY updated_at DESC
            LIMIT 1`,
           [title, artist]
@@ -151,17 +158,19 @@ app.post("/discord/commands", async (req, res) => {
         });
       }
 
+      // 2) 新規作成（seed）
       let insertedId = null;
       if (pool) {
         const ins = await pool.query(
-          //"INSERT INTO tracks(title_norm, artist_norm, confidence, provenance) VALUES ($1,$2,0,'{"status":"seed"}') RETURNING id",
-          `INSERT INTO tracks (title_norm, artist_norm, confidence, provenance) VALUES ($1, $2, $3, $4::jsonb) RETURNING id`,
+          `INSERT INTO tracks (title_norm, artist_norm, confidence, provenance)
+           VALUES ($1, $2, $3, $4::jsonb)
+           RETURNING id`,
           [title, artist, 0, JSON.stringify({ status: "seed" })]
-          //[title, artist]
         );
         insertedId = ins.rows[0]?.id;
       }
 
+      // 3) 外部検索（雛形・失敗しても落ちない）
       try {
         const ext = await lookupExternalMinimal({ title, artist });
         if (ext && pool && insertedId) {
@@ -208,6 +217,7 @@ app.post("/discord/commands", async (req, res) => {
   }
 });
 
+/* ====== Jobs ====== */
 app.get("/jobs/export-daily", async (_req, res) => {
   try {
     await ensureSchema();
@@ -224,4 +234,5 @@ app.get("/jobs/export-daily", async (_req, res) => {
   }
 });
 
+/* ====== Start ====== */
 app.listen(PORT, () => console.log("MusicDB bot running on port", PORT));
