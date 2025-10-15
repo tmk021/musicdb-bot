@@ -15,6 +15,28 @@ const normalizeWorkCode = raw => {
   return /^\d{3}-\d{4}-\d$/.test(f) ? f : null;
 };
 
+// CSV生成（実データ）
+async function dumpCsvFromDb() {
+  const { rows } = await pool.query(
+    `SELECT title_norm AS title,
+            COALESCE(artist_norm,'') AS artist,
+            COALESCE(work_code,'')  AS work_code,
+            COALESCE(bpm,'')        AS bpm,
+            COALESCE(key,'')        AS key,
+            COALESCE(confidence,0)  AS confidence
+       FROM tracks
+       ORDER BY updated_at DESC
+       LIMIT 5000`
+  );
+  const header = "title,artist,work_code,bpm,key,confidence\n";
+  const body = rows.map(r =>
+    [r.title, r.artist, r.work_code, r.bpm, r.key, r.confidence]
+      .map(v => `"${String(v).replace(/"/g,'""')}"`)
+      .join(",")
+  ).join("\n");
+  return header + body + "\n";
+}
+
 
 // --- Middleware to capture raw body for Discord signature verification
 const app = express();
@@ -148,6 +170,18 @@ BPM/Key: ${t.bpm || "—"} / ${t.key || "—"}
     data: { content: "コマンドが未対応です。" }
   });
 });
+
+async function discordNotify(message) {
+  const token = process.env.DISCORD_TOKEN;
+  const channel = process.env.SYSTEM_STATUS_CHANNEL;
+  if (!token || !channel) return; // 未設定なら黙ってスキップ
+  await fetch(`https://discord.com/api/v10/channels/${channel}/messages`, {
+    method: "POST",
+    headers: { "Authorization": `Bot ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ content: message })
+  });
+}
+
 
 // Simple job endpoints (for Render Cron)
 app.get("/jobs/export-daily", (_req, res) => res.send("OK: export-daily"));
