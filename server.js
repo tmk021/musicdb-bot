@@ -1,22 +1,64 @@
 import express from "express";
-import nacl from "tweetnacl";
+import fetch from "node-fetch";
+import { google } from "googleapis";
 import pkg from "pg";
+import nacl from "tweetnacl";
 const { Pool } = pkg;
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// シンプル正規化（必要なら後でNFKC/かな整形を追加）
-const norm = s => (s || "").trim();
+const app = express();
+app.use(express.text({ type: "*/*" }));
 
-// 作品コード整形：8桁→ 3-4-1
-const normalizeWorkCode = raw => {
-  const d = (raw || "").replace(/\D/g, "");
-  if (d.length !== 8) return null;
-  const f = `${d.slice(0,3)}-${d.slice(3,7)}-${d.slice(7)}`;
-  return /^\d{3}-\d{4}-\d$/.test(f) ? f : null;
-};
+const PORT = process.env.PORT || 3000;
+const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const SYSTEM_STATUS_CHANNEL = process.env.SYSTEM_STATUS_CHANNEL;
+const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
 
-// CSV生成（実データ）
+function verifyDiscordSignature(req) {
+  if (!DISCORD_PUBLIC_KEY) return false;
+  const signature = req.get("X-Signature-Ed25519");
+  const timestamp = req.get("X-Signature-Timestamp");
+  const body = req.body || "";
+  if (!signature || !timestamp) return false;
+  const isVerified = nacl.sign.detached.verify(
+    Buffer.from(timestamp + body),
+    Buffer.from(signature, "hex"),
+    Buffer.from(DISCORD_PUBLIC_KEY, "hex")
+  );
+  return isVerified;
+}
+
+async function discordNotify(message) {
+  if (!DISCORD_TOKEN || !SYSTEM_STATUS_CHANNEL) return;
+  await fetch(`https://discord.com/api/v10/channels/${SYSTEM_STATUS_CHANNEL}/messages`, {
+    method: "POST",
+    headers: { "Authorization": `Bot ${DISCORD_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ content: message })
+  }).catch(()=>{});
+}
+
+async function ensureSchema() {
+  if (!pool) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tracks (
+      id SERIAL PRIMARY KEY,
+      title_norm TEXT NOT NULL,
+      artist_norm TEXT,
+      work_code TEXT CHECK (work_code ~ '^[0-9]{3}-[0-9]{4}-[0-9]$') OR work_code IS NULL,
+      bpm TEXT,
+      key TEXT,
+      confidence INTEGER DEFAULT 0,
+      provenance JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMP DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_tracks_artist_title ON tracks(artist_norm, title_norm);
+  `);
+}
+
+const norm = (s) => (s || "").trim();
+
 async function dumpCsvFromDb() {
+  if (!pool) return "title,artist,work_code,bpm,key,confidence\n";
   const { rows } = await pool.query(
     `SELECT title_norm AS title,
             COALESCE(artist_norm,'') AS artist,
@@ -31,165 +73,149 @@ async function dumpCsvFromDb() {
   const header = "title,artist,work_code,bpm,key,confidence\n";
   const body = rows.map(r =>
     [r.title, r.artist, r.work_code, r.bpm, r.key, r.confidence]
-      .map(v => `"${String(v).replace(/"/g,'""')}"`)
+      .map(v => `"${String(v).replace(/"/g, '""')}"`)
       .join(",")
   ).join("\n");
-  return header + body + "\n";
+  return header + (body ? body + "\n" : "");
 }
 
-
-// --- Middleware to capture raw body for Discord signature verification
-const app = express();
-app.use(express.raw({ type: 'application/json' }));
-
-// Helpers
-function verifyDiscordRequest(req, publicKey) {
-  const signature = req.header("X-Signature-Ed25519");
-  const timestamp = req.header("X-Signature-Timestamp");
-  const body = req.body; // Buffer because of express.raw
-
-  if (!signature || !timestamp) return false;
-  try {
-    const isVerified = nacl.sign.detached.verify(
-      Buffer.from(timestamp + body.toString(), "utf8"),
-      Buffer.from(signature, "hex"),
-      Buffer.from(publicKey, "hex")
-    );
-    return isVerified;
-  } catch (e) {
-    return false;
+async function uploadToDrive(filename, csvText) {
+  const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN } = process.env;
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
+    throw new Error("Google credentials missing");
   }
+  const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+  auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+  const drive = google.drive({ version: "v3", auth });
+
+  const folderName = "musicdb_exports";
+  const list = await drive.files.list({
+    q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: "files(id)"
+  });
+  let folderId = list.data.files?.[0]?.id;
+  if (!folderId) {
+    const f = await drive.files.create({
+      requestBody: { name: folderName, mimeType: "application/vnd.google-apps.folder" },
+      fields: "id"
+    });
+    folderId = f.data.id;
+  }
+  const fileRes = await drive.files.create({
+    requestBody: { name: filename, parents: [folderId] },
+    media: { mimeType: "text/csv", body: csvText },
+    fields: "id, webViewLink"
+  });
+  return fileRes.data.webViewLink;
 }
 
-// Root health
-app.get("/", (_req, res) => res.status(200).send("MusicDB Bot server is running"));
+import { lookupExternalMinimal } from "./services/lookup.js";
 
-// Discord interactions endpoint
-app.post("/discord/commands", (req, res) => {
-  const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY || "";
-  if (!PUBLIC_KEY || !verifyDiscordRequest(req, PUBLIC_KEY)) {
-    return res.status(401).send("invalid request signature");
-  }
+app.get("/", (_req, res) => res.send("MusicDB Bot Server is running"));
 
-  let data = {};
+app.post("/discord/commands", async (req, res) => {
   try {
-    data = JSON.parse(req.body.toString("utf8"));
-  } catch (e) {
-    return res.status(400).send("bad json");
-  }
+    if (!verifyDiscordSignature(req)) return res.status(401).send("bad signature");
+    const data = JSON.parse(req.body || "{}");
+    if (data?.type === 1) return res.json({ type: 1 }); // PING
+    const name = data?.data?.name;
 
-  // PING (type 1)
-  if (data.type === 1) {
-    return res.json({ type: 1 });
-  }
+    if (name === "track_search") {
+      const title = norm(data.data.options?.find(o => o.name === "title")?.value);
+      const artist = norm(data.data.options?.find(o => o.name === "artist")?.value || "");
 
-  const name = data?.data?.name;
+      await ensureSchema();
 
-  // Minimal handlers (you can expand later)
-  if (name === "track_search") {
-  try {
-    const title  = norm(data.data.options?.find(o => o.name === "title")?.value);
-    const artist = norm(data.data.options?.find(o => o.name === "artist")?.value);
+      let found = null;
+      if (pool) {
+        const r = await pool.query(
+          "SELECT * FROM tracks WHERE title_norm=$1 AND (artist_norm=$2 OR $2='') ORDER BY updated_at DESC LIMIT 1",
+          [title, artist]
+        );
+        found = r.rows[0] || null;
+      }
 
-    // 1) まずDBから検索
-    const q1 = `SELECT * FROM tracks
-                WHERE title_norm = $1 AND (artist_norm = $2 OR $2 = '')
-                ORDER BY updated_at DESC LIMIT 1`;
-    const r1 = await pool.query(q1, [title, artist]);
+      if (found) {
+        return res.json({
+          type: 4,
+          data: { content:
+            `🎵 ${found.title_norm}${found.artist_norm ? " — " + found.artist_norm : ""}\n` +
+            `作品コード: ${found.work_code || "—"}\n` +
+            `BPM/Key: ${found.bpm || "—"} / ${found.key || "—"}\n` +
+            `信頼度: ${found.confidence || 0}`
+          }
+        });
+      }
 
-    if (r1.rows.length) {
-      const t = r1.rows[0];
+      let insertedId = null;
+      if (pool) {
+        const ins = await pool.query(
+          "INSERT INTO tracks(title_norm, artist_norm, confidence, provenance) VALUES ($1,$2,0,'{"status":"seed"}') RETURNING id",
+          [title, artist]
+        );
+        insertedId = ins.rows[0]?.id;
+      }
+
+      try {
+        const ext = await lookupExternalMinimal({ title, artist });
+        if (ext && pool && insertedId) {
+          await pool.query(
+            `UPDATE tracks SET
+               work_code=$1, bpm=$2, key=$3, confidence=$4,
+               provenance = COALESCE(provenance,'{}'::jsonb) || $5::jsonb,
+               updated_at=now()
+             WHERE id=$6`,
+            [ext.work_code, ext.bpm, ext.key, ext.confidence, JSON.stringify(ext.provenance), insertedId]
+          );
+        }
+      } catch (e) {
+        console.warn("lookupExternalMinimal failed:", e.message);
+      }
+
       return res.json({
         type: 4,
-        data: {
-          content:
-`🎵 ${t.title_norm}${t.artist_norm ? " — " + t.artist_norm : ""}
-作品コード: ${t.work_code || "—"}
-BPM/Key: ${t.bpm || "—"} / ${t.key || "—"}
-信頼度: ${t.confidence || 0}`
+        data: { content:
+          `🟡 データ未登録でした。ベースを作成しました。\n` +
+          `タイトル: ${title}${artist ? " / " + artist : ""}\n` +
+          `→ 自動再検索でBPM/Key/作品コードを取得します。`
         }
       });
     }
 
-    // 2) なければ種レコードを作成（後で外部連携で埋める）
-    const ins = await pool.query(
-      `INSERT INTO tracks (title_norm, artist_norm, confidence, provenance)
-       VALUES ($1, $2, 0, '{"status":"seed"}') RETURNING *`,
-      [title, artist]
-    );
-
-    // 3) ここで「外部最小連携」を呼ぶ場所（まずはスタブ）
-    const stub = {
-      work_code: normalizeWorkCode("123-4567-8"),
-      bpm: "92",
-      key: "A minor",
-      confidence: 96,
-      provenance: { source: "stub", fetched_at: new Date().toISOString() }
-    };
-
-    if (stub && stub.confidence >= 95) {
-      await pool.query(
-        `UPDATE tracks SET
-           work_code=$1, bpm=$2, key=$3, confidence=$4,
-           provenance = COALESCE(provenance,'{}'::jsonb) || $5::jsonb,
-           updated_at=now()
-         WHERE id=$6`,
-        [stub.work_code, stub.bpm, stub.key, stub.confidence, JSON.stringify(stub.provenance), ins.rows[0].id]
+    if (name === "artist_list") {
+      const artist = norm(data.data.options?.find(o => o.name === "name")?.value);
+      const limit = Number(data.data.options?.find(o => o.name === "limit")?.value || 25);
+      await ensureSchema();
+      if (!pool) return res.json({ type: 4, data: { content: "DB未設定です" } });
+      const r = await pool.query(
+        "SELECT title_norm, work_code, bpm, key FROM tracks WHERE artist_norm=$1 ORDER BY updated_at DESC LIMIT $2",
+        [artist, Math.min(limit, 50)]
       );
+      const lines = r.rows.map(x => `・${x.title_norm} (${x.work_code || "—"})`).join("\n") || "該当なし";
+      return res.json({ type: 4, data: { content: `🎤 ${artist}\n${lines}` } });
     }
 
-    return res.json({
-      type: 4,
-      data: {
-        content:
-`🟡 データ未登録でした。ベースを作成しました。
-タイトル: ${title}${artist ? " / " + artist : ""}
-→ 後続の自動再検索でBPM/Key/作品コードを取得します。`
-      }
-    });
+    return res.json({ type: 4, data: { content: "Unknown command" } });
   } catch (e) {
-    console.error("track_search error:", e);
-    return res.json({ type: 4, data: { content: "❌ 内部エラーが発生しました（管理者に通知済み）" } });
+    console.error("discord handler error:", e);
+    return res.status(500).send("error");
   }
-}
-
-
-  if (name === "artist_list") {
-    const artist = data.data.options?.find(o => o.name === "name")?.value || "";
-    return res.json({
-      type: 4,
-      data: {
-        content: `🎤 アーティスト一覧（仮）: ${artist}\n（サンプル動作：後でDB参照に置き換えます）`
-      }
-    });
-  }
-
-  // Fallback
-  return res.json({
-    type: 4,
-    data: { content: "コマンドが未対応です。" }
-  });
 });
 
-async function discordNotify(message) {
-  const token = process.env.DISCORD_TOKEN;
-  const channel = process.env.SYSTEM_STATUS_CHANNEL;
-  if (!token || !channel) return; // 未設定なら黙ってスキップ
-  await fetch(`https://discord.com/api/v10/channels/${channel}/messages`, {
-    method: "POST",
-    headers: { "Authorization": `Bot ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ content: message })
-  });
-}
+app.get("/jobs/export-daily", async (_req, res) => {
+  try {
+    await ensureSchema();
+    const csvText = await dumpCsvFromDb();
+    const filename = `export_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+    const link = await uploadToDrive(filename, csvText);
+    await discordNotify(`📦 エクスポート完了: ${link}`);
+    console.log("✅ CSV exported:", link);
+    res.send(`OK: ${link}`);
+  } catch (e) {
+    console.error("export-daily error:", e);
+    await discordNotify(`❌ エクスポート失敗: ${e.message || e}`);
+    res.status(500).send("NG");
+  }
+});
 
-
-// Simple job endpoints (for Render Cron)
-app.get("/jobs/export-daily", (_req, res) => res.send("OK: export-daily"));
-app.get("/jobs/hot-recheck", (_req, res) => res.send("OK: hot-recheck"));
-app.get("/jobs/export-weekly", (_req, res) => res.send("OK: export-weekly"));
-app.get("/jobs/monthly-check", (_req, res) => res.send("OK: monthly-check"));
-app.get("/jobs/check-tokens", (_req, res) => res.send("OK: check-tokens"));
-
-// Start
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => console.log("MusicDB bot running on port", PORT));
