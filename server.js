@@ -226,4 +226,21 @@ app.get("/jobs/export-daily", async (_req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log("MusicDB bot running on port", PORT));
+// （これを置き換え）
+// app.listen(PORT, () => console.log("MusicDB bot running on port", PORT));
+
+// 起動時にDBスキーマ作成→ログ出力→サーバ起動
+(async () => {
+  try {
+    if (pool) {
+      await ensureSchema();
+      console.log("✅ DB schema ensured");
+    } else {
+      console.warn("⚠️ DATABASE_URL が未設定のため、DB接続はスキップします");
+    }
+  } catch (e) {
+    console.error("❌ DB init error:", e);
+  } finally {
+    app.listen(PORT, () => console.log("MusicDB bot running on port", PORT));
+  }
+})();
